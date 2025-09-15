@@ -71,40 +71,78 @@ class GDBController:
 
         results = []
         for msg in msgs:
-            payload = msg.get("payload")
-            mtype = msg.get("type")
             message = msg.get("message")
+            payload = msg.get("payload")
+            msg_type = msg.get("type")
+            
+            # 处理程序状态变化
+            if msg_type == "notify":
 
-            # --- 调用栈 ---
-            if isinstance(payload, dict) and "stack" in payload:
-                stack = payload["stack"]
-                self.call_stack = stack
-                formatted = format_stack_trace(stack)
-                logger(INFO, "Call stack:\n" + formatted, stacklevel=4)
-                results.append({"kind": "backtrace", "frames": stack})
-
-            # --- 断点 ---
-            elif isinstance(payload, dict) and ("bkpt" in payload or "number" in payload):
-                logger(INFO, f"Breakpoint info: {payload}", stacklevel=4)
-                results.append({"kind": "breakpoint", "payload": payload})
-
-            # --- 信号/崩溃 ---
-            elif isinstance(payload, dict) and ("signal-name" in payload or "reason" in payload):
-                sig = payload.get("signal-name") or payload.get("reason")
-                self.status = ProgramStatus.CRASHED
-                self.signal = sig
-                logger(WARNING, f"Program crashed: {sig}", stacklevel=4)
-                results.append({"kind": "signal", "signal": sig})
-
-            # --- result:done 等通用消息 ---
-            elif mtype == "result" and message in ("done", "running", "connected"):
-                logger(INFO, f"GDB result: {message}", stacklevel=4)
-                results.append({"kind": "result", "message": message})
-
-            else:
-                # 默认回退：原始打印
-                results.append({"kind": "generic", "msg": msg})
-
+                if message == "stopped":
+                    self.status = ProgramStatus.STOPPED
+                    if payload and "reason" in payload:
+                        reason = payload["reason"]
+                        if reason == "breakpoint-hit":
+                            logger(WARNING, f"Program stopped at breakpoint: {reason}", stacklevel=4)
+                        elif reason == "signal-received":
+                            self.status = ProgramStatus.CRASHED
+                            signal_name = payload.get("signal-name", "unknown")
+                            self.signal = signal_name
+                            logger(WARNING, f"Program crashed with signal: {signal_name}", stacklevel=4)
+                            self.get_stack_trace()
+                        else:
+                            logger(INFO, f"Program stopped: {reason}", stacklevel=4)
+                    
+                    # 记录断点信息
+                    if payload and "bkptno" in payload:
+                        logger(INFO, f"Breakpoint number: {payload['bkptno']}", stacklevel=4)
+                
+                elif message == "running":
+                    self.status = ProgramStatus.RUNNING
+                    logger(INFO, "Program is running", stacklevel=4)
+                
+                elif message == "thread-created":
+                    logger(DEBUG, f"Thread created: {payload}", stacklevel=4)
+                
+                elif message == "thread-group-started":
+                    logger(DEBUG, f"Thread group started: {payload}", stacklevel=4)
+            
+            # 处理命令执行结果
+            elif msg_type == "result":
+                if message == "done":
+                    if payload and "bkpt" in payload:
+                        self.breakpoint_info = payload["bkpt"]
+                        logger(INFO, f"Breakpoint info: {self.breakpoint_info}", stacklevel=4)
+                        results.append(self.breakpoint_info)
+                    elif payload and "stack" in payload:
+                        self.call_stack = payload["stack"]
+                        formatted_stack = format_stack_trace(self.call_stack)
+                        logger(INFO, f"Call stack:\n{formatted_stack}", stacklevel=4)
+                        results.append(self.call_stack)
+                    else:
+                        logger(INFO, f"GDB result: {message}", stacklevel=4)
+                        results.append(message)
+                
+                elif message == "running":
+                    self.status = ProgramStatus.RUNNING
+                    logger(INFO, "Program started running", stacklevel=4)
+                    results.append(message)
+            
+            # 处理控制台输出
+            elif msg_type == "console":
+                if payload and "exited" in payload:
+                    self.status = ProgramStatus.EXITED
+                    logger(INFO, "Program exited normally", stacklevel=4)
+                elif payload and "terminated" in payload:
+                    self.status = ProgramStatus.CRASHED
+                    logger(WARNING, "Program terminated unexpectedly", stacklevel=4)
+            
+            # 处理日志信息
+            elif msg_type == "log":
+                if payload and "exited" in payload:
+                    self.status = ProgramStatus.EXITED
+                    logger(INFO, "Program exited normally", stacklevel=4)
+        
         return results
 
     # -----------------
@@ -123,12 +161,19 @@ class GDBController:
         self.process_output(resp, f"Running program")
 
         self.status = ProgramStatus.RUNNING
+        
         return self.status
 
     def get_stack_trace(self) -> List[Dict[str, Any]]:
         resp = self.gdb.write("-stack-list-frames")
-        result = self.process_output(resp, f"Fetching call stack")
+        self.process_output(resp, f"Fetching call stack")
         return self.call_stack
+    
+    def continue_exec(self) -> ProgramStatus:
+        """继续执行程序，直到下一个断点或程序结束"""
+        resp = self.gdb.write("-exec-continue")
+        self.process_output(resp, "Continuing program execution")
+        return self.status
 
     def close(self):
         logger(INFO, "Exiting gdb_controller!")
@@ -139,9 +184,10 @@ class GDBController:
 # -----------------
 if __name__ == "__main__":
     logger(INFO, "Now Running test demo")
-    Logger.setLevel(DEBUG)
+    Logger.setLevel(INFO)
     gdb = GDBController(target_binary="targets/crashme")
     gdb.set_breakpoint("funC")
-    gdb.run("test_argument")
+    gdb.run("test_arg")
     gdb.get_stack_trace()
+    gdb.continue_exec()
     gdb.close()
